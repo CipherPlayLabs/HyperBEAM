@@ -74,7 +74,10 @@ read(ID, Opts) ->
                     {error, not_found};
                 Item ->
                     ?event({read_found, {id, ID}, {item, Item}}),
-                    result_to_message(ID, Item, Opts)
+                    try result_to_message(ID, Item, Opts)
+                    catch
+                        throw:{gateway_data_unavailable, {error, _} = Err} -> Err
+                    end
             end
     end.
 
@@ -103,7 +106,7 @@ item_spec() ->
 %% where `<id>' is the base64-url-encoded transaction ID.
 data(ID, Opts) ->
     Req = #{
-        <<"multirequest-accept-status">> => 200,
+        <<"multirequest-admissible-status">> => 200,
         <<"multirequest-responses">> => 1,
         <<"path">> => <<"/arweave/raw/", ID/binary>>,
         <<"method">> => <<"GET">>
@@ -293,8 +296,10 @@ result_to_message(ExpectedID, Item, Opts) ->
             #{ <<"size">> := Zero } when Zero =:= <<"0">> orelse Zero =:= 0 -> <<>>;
             BinData when is_binary(BinData) -> BinData;
             _ ->
-                {ok, Bytes} = data(ExpectedID, Opts),
-                Bytes
+                case data(ExpectedID, Opts) of
+                    {ok, Bytes} -> Bytes;
+                    {error, _} = Err -> throw({gateway_data_unavailable, Err})
+                end
         end,
     DataSize = byte_size(Data),
     ?event(gateway, {data, {id, ExpectedID}, {data, Data}, {item, Item}}, Opts),
