@@ -99,37 +99,54 @@ item_spec() ->
         cursor
     """>>.
 
-%% @doc Get the data associated with a transaction by its ID, using the node's
-%% Arweave `gateway' peers. The item is expected to be available in its 
-%% unmodified (by caches or other proxies) form at the following location:
-%%      https://<gateway>/raw/<id>
-%% where `<id>' is the base64-url-encoded transaction ID.
-data(ID, Opts) ->
-    Req = #{
-        <<"multirequest-admissible-status">> => 200,
-        <<"multirequest-responses">> => 1,
-        <<"path">> => <<"/arweave/raw/", ID/binary>>,
-        <<"method">> => <<"GET">>
-    },
-    case hb_http:request(Req, Opts) of
-        {ok, Data} when is_binary(Data) -> {ok, Data};
-        {ok, Res} ->
-            Data =
-                case hb_maps:find(<<"data">>, Res, Opts) of
-                    {ok, D} -> D;
-                    _ -> hb_ao:get(<<"body">>, Res, <<>>, Opts)
-                end,
+%% @doc Get the data associated with a transaction by its ID by trying a
+%% sequence of public gateways in order and returning the first 200 body.
+%% Bypasses dev_router / hb_http_multi so the gateway list is explicit and
+%% controllable independent of route configuration.
+data(ID, _Opts) ->
+    Gateways =
+        [
+            <<"https://ar-io.dev">>,
+            <<"https://permagate.io">>,
+            <<"https://arweave.net">>
+        ],
+    try_gateways_for_data(Gateways, ID).
+
+try_gateways_for_data([], ID) ->
+    ?event(gateway, {data_all_gateways_failed, {id, ID}}),
+    {error, no_viable_gateway};
+try_gateways_for_data([Gateway | Rest], ID) ->
+    URL = binary_to_list(<<Gateway/binary, "/raw/", ID/binary>>),
+    HttpOpts = [{timeout, 8000}, {connect_timeout, 4000}, {autoredirect, true}],
+    ReqOpts = [{body_format, binary}],
+    case httpc:request(get, {URL, []}, HttpOpts, ReqOpts) of
+        {ok, {{_, 200, _}, _Headers, Body}} when is_binary(Body) ->
             ?event(gateway,
-                {data,
+                {data_fetched,
+                    {gateway, Gateway},
                     {id, ID},
-                    {response, Res},
-                    {data, Data}
+                    {size, byte_size(Body)}
                 }
             ),
-            {ok, Data};
-        Res ->
-            ?event(gateway, {request_error, {id, ID}, {response, Res}}),
-            {error, no_viable_gateway}
+            {ok, Body};
+        {ok, {{_, Status, _}, _, _}} ->
+            ?event(gateway,
+                {data_skipped,
+                    {gateway, Gateway},
+                    {id, ID},
+                    {status, Status}
+                }
+            ),
+            try_gateways_for_data(Rest, ID);
+        {error, Reason} ->
+            ?event(gateway,
+                {data_http_error,
+                    {gateway, Gateway},
+                    {id, ID},
+                    {reason, Reason}
+                }
+            ),
+            try_gateways_for_data(Rest, ID)
     end.
 
 %% @doc Find the location of the scheduler based on its ID, through GraphQL.
