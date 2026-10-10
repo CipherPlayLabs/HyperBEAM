@@ -23,7 +23,8 @@
 %%%   GET  /~bridge@1.0/status    cursors, last pass, last error
 %%%
 %%% Configuration, under the node option `bridge':
-%%%   pusd, interval (ms), keys-file, state-file,
+%%%   pusd, pusd-node (the URL of the node that runs PUSD; omit when it is this
+%%%   node), interval (ms), keys-file, state-file,
 %%%   base => #{ rpc, contract, chain-id, confirmations, from-block, log-range },
 %%%   solana => #{ rpc, program, commitment }, sui => #{ rpc, package, bridge }
 -module(dev_bridge).
@@ -328,30 +329,55 @@ vote(P, St = #{ cfg := Cfg, keys := Keys }) ->
 
 %%% AO ------------------------------------------------------------------------
 
-%% Commit with the node's wallet and schedule onto PUSD, as dev_push does.
+%% Commit with the node's wallet and schedule onto PUSD: locally as dev_push
+%% does when PUSD runs here, else by posting the signed message to the
+%% scheduler of the node that runs it, as any wallet client does.
 send(Tags, #{ cfg := Cfg, opts := Opts }) ->
     Pusd = maps:get(<<"pusd">>, Cfg),
-    Signed = hb_message:commit(Tags#{ <<"target">> => Pusd }, Opts, <<"httpsig@1.0">>),
-    {ok, _} = hb_cache:write(Signed, Opts),
-    {ok, Proc} = hb_cache:read(Pusd, Opts),
-    Res = hb_ao:resolve({as, <<"process@1.0">>, Proc},
-        #{ <<"path">> => <<"schedule">>, <<"method">> => <<"POST">>, <<"body">> => Signed }, Opts),
+    Res = case maps:get(<<"pusd-node">>, Cfg, undefined) of
+        undefined ->
+            Signed = hb_message:commit(Tags#{ <<"target">> => Pusd }, Opts, <<"httpsig@1.0">>),
+            {ok, _} = hb_cache:write(Signed, Opts),
+            {ok, Proc} = hb_cache:read(Pusd, Opts),
+            hb_ao:resolve({as, <<"process@1.0">>, Proc},
+                #{ <<"path">> => <<"schedule">>, <<"method">> => <<"POST">>, <<"body">> => Signed }, Opts);
+        Node ->
+            % `subject: self' or the scheduler schedules the request body.
+            Signed = hb_message:commit(Tags#{ <<"target">> => Pusd, <<"type">> => <<"Message">>,
+                <<"subject">> => <<"self">> }, Opts, <<"httpsig@1.0">>),
+            hb_http:post(Node, <<"/", Pusd/binary, "~process@1.0/schedule">>, Signed, Opts)
+    end,
     ?event(bridge, {sent, maps:get(<<"action">>, Tags), Res}),
     Res.
 
 %% A published key as decoded JSON, or #{} when absent (the node answers a
 %% missing key with its HTML page, never with an error).
 published(Key, #{ cfg := Cfg, opts := Opts }) ->
-    {ok, Proc} = hb_cache:read(maps:get(<<"pusd">>, Cfg), Opts),
-    case hb_ao:get(<<"now/", Key/binary>>, Proc, not_found, Opts) of
-        Bin when is_binary(Bin) ->
-            case catch hb_json:decode(Bin) of
-                V when is_map(V); is_list(V) -> V;
+    Pusd = maps:get(<<"pusd">>, Cfg),
+    case maps:get(<<"pusd-node">>, Cfg, undefined) of
+        undefined ->
+            {ok, Proc} = hb_cache:read(Pusd, Opts),
+            json_value(hb_ao:get(<<"now/", Key/binary>>, Proc, not_found, Opts));
+        Node ->
+            Url = <<Node/binary, "/", Pusd/binary, "~process@1.0/now/", Key/binary>>,
+            case hb_bridge_chains:get_body(Url, Opts) of
+                {ok, Body} -> json_value(Body);
                 _ -> #{}
-            end;
-        V when is_map(V); is_list(V) -> V;
-        _ -> #{}
+            end
     end.
+
+%% A published value as decoded JSON. It may arrive as JSON text, as JSON text
+%% inside a JSON string, or wrapped in a `body'; an HTML page means absent.
+json_value(V) when is_map(V), is_map_key(<<"body">>, V) -> json_value(maps:get(<<"body">>, V));
+json_value(V) when is_map(V); is_list(V) -> V;
+json_value(<<"<", _/binary>>) -> #{};
+json_value(Bin) when is_binary(Bin) ->
+    case catch hb_json:decode(Bin) of
+        S when is_binary(S) -> json_value(S);
+        V when is_map(V); is_list(V) -> json_value(V);
+        _ -> #{}
+    end;
+json_value(_) -> #{}.
 
 %% @doc Has PUSD minted `<chain>:<nonce>'? Its published watermark says.
 minted(Info, Chain, Nonce) ->
@@ -434,6 +460,15 @@ proposals_to_vote_test() ->
         P(4, <<"applied">>, #{ Me => true }, #{})
     ] },
     ?assertEqual([1], [maps:get(<<"id">>, X) || X <- proposals_to_vote(Info, Me)]).
+
+json_value_test() ->
+    Info = #{ <<"epoch">> => 2 },
+    Text = hb_json:encode(Info),
+    ?assertEqual(Info, json_value(Text)),
+    ?assertEqual(Info, json_value(hb_json:encode(Text))),
+    ?assertEqual(Info, json_value(#{ <<"body">> => Text })),
+    ?assertEqual(#{}, json_value(<<"<!doctype html><html>">>)),
+    ?assertEqual(#{}, json_value(not_found)).
 
 minted_test() ->
     Info = #{ <<"processed">> => #{ <<"base">> => #{ <<"floor">> => 5, <<"above">> => [7, 9] } } },

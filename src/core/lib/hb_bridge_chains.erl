@@ -10,7 +10,7 @@
 %%% `#{chain, nonce, token, recipient, amount, tx}' and a release is
 %%% `#{chain, id, tx}', with `id' the chain's (namespaced) withdrawal id.
 -module(hb_bridge_chains).
--export([rpc/4, base_head/2, base_scan/4, solana_scan/3, sui_scan/3]).
+-export([rpc/4, get_body/2, base_head/2, base_scan/4, solana_scan/3, sui_scan/3]).
 -export([anchor_events/2]).
 -include_lib("eunit/include/eunit.hrl").
 
@@ -26,6 +26,15 @@ rpc(Url, Method, Params, Opts) ->
         {ok, #{ <<"error">> := Error }} -> {error, {rpc, Method, Error}};
         {ok, Other} -> {error, {rpc, Method, Other}};
         Error -> Error
+    end.
+
+%% @doc GET a URL as JSON through relay@1.0; the raw body.
+get_body(Url, Opts) ->
+    Req = #{ <<"device">> => <<"relay@1.0">>, <<"method">> => <<"GET">>, <<"path">> => Url,
+        <<"accept">> => <<"application/json">> },
+    case hb_ao:resolve(Req, <<"call">>, Opts) of
+        {ok, Res} -> {ok, hb_maps:get(<<"body">>, Res, <<>>, Opts)};
+        Error -> {error, {get, Url, Error}}
     end.
 
 %% @doc POST a JSON body through relay@1.0, the node's own HTTP client.
