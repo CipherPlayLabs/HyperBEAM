@@ -4,7 +4,7 @@
 %%%
 %%%   Base    `eth-client@1.0' get-data over a confirmed block range
 %%%   Solana  getSignaturesForAddress + getTransaction, Anchor event logs
-%%%   Sui     suix_queryEvents by Move event type
+%%%   Sui     Sui GraphQL events by Move event type
 %%%
 %%% JSON-RPC goes through `relay@1.0', the node's own HTTP client. A deposit is
 %%% `#{chain, nonce, token, recipient, amount, tx}' and a release is
@@ -18,28 +18,33 @@
 -define(RELEASED_SIG, <<"Released(uint64,address,address,uint256)">>).
 -define(PAGE, 100).
 
-%% @doc One JSON-RPC call through relay@1.0; the decoded `result'.
+%% @doc One JSON-RPC call; the decoded `result'.
 rpc(Url, Method, Params, Opts) ->
+    Body = #{ <<"jsonrpc">> => <<"2.0">>, <<"id">> => 1, <<"method">> => Method, <<"params">> => Params },
+    case post_json(Url, Body, Opts) of
+        {ok, #{ <<"result">> := Result }} -> {ok, Result};
+        {ok, #{ <<"error">> := Error }} -> {error, {rpc, Method, Error}};
+        {ok, Other} -> {error, {rpc, Method, Other}};
+        Error -> Error
+    end.
+
+%% @doc POST a JSON body through relay@1.0, the node's own HTTP client.
+post_json(Url, Body, Opts) ->
     Req = #{
         <<"device">> => <<"relay@1.0">>,
         <<"method">> => <<"POST">>,
         <<"path">> => Url,
         <<"content-type">> => <<"application/json">>,
-        <<"body">> => hb_json:encode(#{
-            <<"jsonrpc">> => <<"2.0">>, <<"id">> => 1,
-            <<"method">> => Method, <<"params">> => Params
-        })
+        <<"body">> => hb_json:encode(Body)
     },
     case hb_ao:resolve(Req, <<"call">>, Opts) of
         {ok, Res} ->
-            Body = hb_maps:get(<<"body">>, Res, <<>>, Opts),
-            case catch hb_json:decode(Body) of
-                #{ <<"result">> := Result } -> {ok, Result};
-                #{ <<"error">> := Error } -> {error, {rpc, Method, Error}};
-                Other -> {error, {rpc, Method, Other}}
+            case catch hb_json:decode(hb_maps:get(<<"body">>, Res, <<>>, Opts)) of
+                Decoded when is_map(Decoded) -> {ok, Decoded};
+                Other -> {error, {post_json, Url, Other}}
             end;
         Error ->
-            {error, {rpc, Method, Error}}
+            {error, {post_json, Url, Error}}
     end.
 
 %%% Base ----------------------------------------------------------------------
@@ -183,8 +188,14 @@ discriminator(Name) ->
 
 %%% Sui -----------------------------------------------------------------------
 
-%% @doc Deposits and releases after `Cursors' (`#{deposit, released}' event
-%% ids, undefined: from the start), and the advanced cursors.
+-define(SUI_GRAPHQL, <<"https://graphql.mainnet.sui.io/graphql">>).
+-define(SUI_EVENTS, <<"query($type: String!, $after: String) { events(first: 50, after: $after, ",
+    "filter: { type: $type }) { pageInfo { hasNextPage endCursor } ",
+    "nodes { contents { json } transaction { digest } } } }">>).
+
+%% @doc Deposits and releases after `Cursors' (`#{deposit, released}' GraphQL
+%% cursors, undefined: from the start), and the advanced cursors. Public Sui
+%% fullnodes no longer serve JSON-RPC, so events come from Sui's GraphQL.
 sui_scan(Cfg, Cursors, Opts) ->
     Pkg = maps:get(<<"package">>, Cfg),
     maybe
@@ -197,25 +208,25 @@ sui_scan(Cfg, Cursors, Opts) ->
     end.
 
 sui_events(Cfg, Type, Cursor, Acc, Opts) ->
-    C = case Cursor of undefined -> null; _ -> Cursor end,
-    Params = [#{ <<"MoveEventType">> => Type }, C, ?PAGE, false],
-    case rpc(maps:get(<<"rpc">>, Cfg), <<"suix_queryEvents">>, Params, Opts) of
-        {ok, #{ <<"data">> := Data, <<"hasNextPage">> := More } = Page} ->
-            Next = case maps:get(<<"nextCursor">>, Page, null) of null -> Cursor; N -> N end,
-            case More of
-                true -> sui_events(Cfg, Type, Next, Acc ++ Data, Opts);
-                false -> {ok, Acc ++ Data, Next}
+    Vars = #{ <<"type">> => Type, <<"after">> => case Cursor of undefined -> null; _ -> Cursor end },
+    Url = maps:get(<<"graphql">>, Cfg, ?SUI_GRAPHQL),
+    case post_json(Url, #{ <<"query">> => ?SUI_EVENTS, <<"variables">> => Vars }, Opts) of
+        {ok, #{ <<"data">> := #{ <<"events">> := #{ <<"nodes">> := Nodes, <<"pageInfo">> := Page } } }} ->
+            Next = case maps:get(<<"endCursor">>, Page, null) of null -> Cursor; N -> N end,
+            case maps:get(<<"hasNextPage">>, Page, false) of
+                true -> sui_events(Cfg, Type, Next, Acc ++ Nodes, Opts);
+                false -> {ok, Acc ++ Nodes, Next}
             end;
-        Error ->
-            Error
+        {ok, Other} -> {error, {sui_graphql, Other}};
+        Error -> Error
     end.
 
-sui_deposit(#{ <<"parsedJson">> := J, <<"id">> := #{ <<"txDigest">> := Tx } }) ->
+sui_deposit(#{ <<"contents">> := #{ <<"json">> := J }, <<"transaction">> := #{ <<"digest">> := Tx } }) ->
     #{ kind => deposit, chain => <<"sui">>, nonce => int(maps:get(<<"nonce">>, J)),
         token => maps:get(<<"coin_type">>, J), recipient => maps:get(<<"ao_recipient">>, J),
         amount => bin(maps:get(<<"amount">>, J)), tx => Tx }.
 
-sui_released(#{ <<"parsedJson">> := J, <<"id">> := #{ <<"txDigest">> := Tx } }) ->
+sui_released(#{ <<"contents">> := #{ <<"json">> := J }, <<"transaction">> := #{ <<"digest">> := Tx } }) ->
     #{ kind => released, chain => <<"sui">>, id => int(maps:get(<<"withdrawal_id">>, J)), tx => Tx }.
 
 %% Sui JSON writes u64 as a string.

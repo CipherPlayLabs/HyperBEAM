@@ -42,18 +42,22 @@ info(_) ->
 %%% Endpoints -----------------------------------------------------------------
 
 %% @doc The node `start' hook: spawn the loop once, hand the node message back.
+%% Never fails: a bridge problem must not stop the node from booting.
 start(_Base, Req, Opts) ->
     NodeMsg = hb_maps:get(<<"body">>, Req, Opts, Opts),
-    case config(NodeMsg) of
-        #{ <<"pusd">> := _ } = Cfg ->
-            case hb_name:lookup(?NAME) of
-                Pid when is_pid(Pid) -> ok;
-                _ ->
-                    Pid = spawn(fun() -> init(Cfg, NodeMsg) end),
-                    hb_name:register(?NAME, Pid)
-            end;
-        _ ->
-            ?event(bridge, {not_configured})
+    try
+        case config(NodeMsg) of
+            #{ <<"pusd">> := _ } = Cfg ->
+                case hb_name:lookup(?NAME) of
+                    Pid when is_pid(Pid) -> ok;
+                    _ ->
+                        Pid = spawn(fun() -> init(Cfg, NodeMsg) end),
+                        hb_name:register(?NAME, Pid)
+                end;
+            _ ->
+                ?event(bridge, {not_configured})
+        end
+    catch C:R:T -> ?event(bridge, {start_failed, C, R, T})
     end,
     {ok, #{ <<"body">> => NodeMsg }}.
 
