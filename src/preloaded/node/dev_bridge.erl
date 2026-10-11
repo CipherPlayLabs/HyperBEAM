@@ -249,11 +249,14 @@ sign_withdrawals(Withdrawals, St = #{ me := Me }) ->
             case Pending andalso not Signed of
                 false -> S;
                 true ->
+                    % `releasesig', never `signature': that is the name of the
+                    % message's own httpsig signature, and the scheduler refuses
+                    % a message that carries both.
                     once(<<"sign:", Id/binary>>, S, fun() ->
                         Sig = withdrawal_signature(W, maps:get(cfg, S), maps:get(keys, S),
                             maps:get(namespace, S)),
                         send(#{ <<"action">> => <<"Bridge-Sign">>, <<"withdrawalid">> => Id,
-                            <<"signature">> => Sig }, S)
+                            <<"releasesig">> => Sig }, S)
                     end)
             end
         end, St, Withdrawals).
