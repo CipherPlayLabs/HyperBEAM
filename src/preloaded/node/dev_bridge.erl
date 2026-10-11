@@ -25,17 +25,23 @@
 %%% whoever claims a withdrawal submits the collected signatures.
 %%%
 %%% Proposals and approvals are made on PUSD by the node's operator, from any
-%%% AO wallet; the node only ever signs. Endpoints, both read-only:
+%%% AO wallet; the node only ever signs. Endpoints, all read-only:
 %%%   GET  /~bridge@1.0/keys      this node's four public keys, to join a set
 %%%   GET  /~bridge@1.0/status    cursors, last pass, last error
+%%%   GET  /~bridge@1.0/nudge     a bridge transaction was just sent: pass now,
+%%%                               then every `fast-interval' for `fast-window'
+%%%
+%%% Passes run every `interval' while idle. A nudge only changes WHEN the next
+%%% pass happens, never what it does, so anyone may send one; passes are still
+%%% at least `fast-interval' apart however many arrive.
 %%%
 %%% Configuration, under the node option `bridge':
 %%%   pusd, pusd-node (the URL of the node that runs PUSD; omit when it is this
-%%%   node), interval (ms), keys-file, state-file, follow-file,
+%%%   node), interval, fast-interval, fast-window (ms), keys-file, state-file, follow-file,
 %%%   base => #{ rpc, contract, chain-id, confirmations, from-block, log-range },
 %%%   solana => #{ rpc, program, commitment }, sui => #{ rpc, package, bridge }
 -module(dev_bridge).
--export([info/1, start/3, status/3, keys/3]).
+-export([info/1, start/3, status/3, keys/3, nudge/3]).
 -export([proposals_to_vote/2, successor_ok/3]).
 -export([withdrawal_signature/4, minted/3]).
 -include("include/hb.hrl").
@@ -45,7 +51,7 @@
 -define(RESEND_MS, 60000).
 
 info(_) ->
-    #{ exports => [<<"start">>, <<"status">>, <<"keys">>] }.
+    #{ exports => [<<"start">>, <<"status">>, <<"keys">>, <<"nudge">>] }.
 
 %%% Endpoints -----------------------------------------------------------------
 
@@ -81,6 +87,12 @@ keys(_Base, _Req, _Opts) ->
         Error -> Error
     end.
 
+nudge(_Base, _Req, _Opts) ->
+    case hb_name:lookup(?NAME) of
+        Pid when is_pid(Pid) -> Pid ! nudge, {ok, json(#{ <<"ok">> => true })};
+        _ -> {error, <<"The bridge loop is not running on this node">>}
+    end.
+
 call(Msg) ->
     case hb_name:lookup(?NAME) of
         Pid when is_pid(Pid) ->
@@ -109,7 +121,8 @@ init(Cfg0, Opts) ->
     St = #{
         cfg => Cfg, opts => Opts, keys => Keys, me => Me,
         cursors => load_cursors(Cfg), deposits => #{}, releases => #{}, sent => #{},
-        last_pass => 0, last_error => null, member => false, namespace => 0
+        last_pass => 0, last_error => null, member => false, namespace => 0,
+        timer => undefined, pass_at => 0, fast_until => 0
     },
     ?event(bridge, {started, {ao, Me}}),
     self() ! pass,
@@ -118,13 +131,29 @@ init(Cfg0, Opts) ->
 loop(St) ->
     receive
         pass ->
-            St2 = try pass(St)
+            Start = os:system_time(millisecond),
+            St1 = St#{ timer => undefined, pass_at => Start },
+            St2 = try pass(St1)
                   catch C:R:T ->
                       ?event(bridge, {pass_failed, C, R, T}),
-                      St#{ last_error => iolist_to_binary(io_lib:format("~p:~p", [C, R])) }
+                      St1#{ last_error => iolist_to_binary(io_lib:format("~p:~p", [C, R])) }
                   end,
-            erlang:send_after(hb_util:int(maps:get(<<"interval">>, maps:get(cfg, St), 5000)), self(), pass),
-            loop(St2);
+            Next = next_interval(maps:get(cfg, St2), maps:get(fast_until, St2), os:system_time(millisecond)),
+            loop(St2#{ timer => erlang:send_after(Next, self(), pass) });
+        nudge ->
+            Now = os:system_time(millisecond),
+            Cfg = maps:get(cfg, St),
+            St1 = St#{ fast_until => Now + cfg_ms(Cfg, <<"fast-window">>, 120000) },
+            %% No timer means a pass is already queued; a timer that already
+            %% fired has queued one too. Either way that pass is soon enough.
+            Timer = maps:get(timer, St1),
+            case Timer =/= undefined andalso erlang:cancel_timer(Timer) =/= false of
+                true ->
+                    Delay = max(0, maps:get(pass_at, St1) + cfg_ms(Cfg, <<"fast-interval">>, 1000) - Now),
+                    loop(St1#{ timer => erlang:send_after(Delay, self(), pass) });
+                false ->
+                    loop(St1)
+            end;
         {status, From, Ref} ->
             From ! {Ref, {ok, status_view(St)}},
             loop(St);
@@ -132,6 +161,12 @@ loop(St) ->
             From ! {Ref, {ok, public_keys(St)}},
             loop(St)
     end.
+
+%% Fast while a nudge is recent, idle otherwise.
+next_interval(Cfg, FastUntil, Now) when Now < FastUntil -> cfg_ms(Cfg, <<"fast-interval">>, 1000);
+next_interval(Cfg, _FastUntil, _Now) -> cfg_ms(Cfg, <<"interval">>, 5000).
+
+cfg_ms(Cfg, Key, Default) -> hb_util:int(maps:get(Key, Cfg, Default)).
 
 pass(St) ->
     Info = published(<<"bridgeinfo">>, St),
@@ -529,6 +564,12 @@ status_view(St) ->
     }.
 
 %%% Tests ---------------------------------------------------------------------
+
+next_interval_test() ->
+    Cfg = #{ <<"interval">> => 15000, <<"fast-interval">> => 1000 },
+    ?assertEqual(1000, next_interval(Cfg, 2000, 1999)),
+    ?assertEqual(15000, next_interval(Cfg, 2000, 2000)),
+    ?assertEqual(5000, next_interval(#{}, 0, 1)).
 
 proposals_to_vote_test() ->
     Me = <<"me">>,
