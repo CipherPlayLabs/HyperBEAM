@@ -27,13 +27,18 @@
 %%% Proposals and approvals are made on PUSD by the node's operator, from any
 %%% AO wallet; the node only ever signs. Endpoints, all read-only:
 %%%   GET  /~bridge@1.0/keys      this node's four public keys, to join a set
-%%%   GET  /~bridge@1.0/status    cursors, last pass, last error
+%%%   GET  /~bridge@1.0/status    cursors, last pass, last error, RPC hosts
 %%%   GET  /~bridge@1.0/nudge     a bridge transaction was just sent: pass now,
 %%%                               then every `fast-interval' for `fast-window'
 %%%
 %%% Passes run every `interval' while idle. A nudge only changes WHEN the next
 %%% pass happens, never what it does, so anyone may send one; passes are still
-%%% at least `fast-interval' apart however many arrive.
+%%% at least `fast-interval' apart however many arrive. A nudge re-arms fast
+%%% mode at most once per NUDGE_GAP_MS, and one fast stretch lasts at most three
+%%% `fast-window's; after that, nudges wait out one idle `interval'.
+%%%
+%%% The cursors and the deposits and releases still waiting are kept in the
+%%% `state-file', so a restart picks up where the node left off.
 %%%
 %%% Configuration, under the node option `bridge':
 %%%   pusd, pusd-node (the URL of the node that runs PUSD; omit when it is this
@@ -49,6 +54,7 @@
 
 -define(NAME, {<<"bridge@1.0">>, loop}).
 -define(RESEND_MS, 60000).
+-define(NUDGE_GAP_MS, 10000).
 
 info(_) ->
     #{ exports => [<<"start">>, <<"status">>, <<"keys">>, <<"nudge">>] }.
@@ -118,11 +124,12 @@ init(Cfg0, Opts) ->
     Cfg = load_follow(Cfg0),
     Keys = load_keys(maps:get(<<"keys-file">>, Cfg, <<"bridge-keys.json">>)),
     Me = hb_util:human_id(ar_wallet:to_address(hb_opts:get(priv_wallet, no_viable_wallet, Opts))),
+    {Cursors, Deposits, Releases} = load_state(Cfg),
     St = #{
         cfg => Cfg, opts => Opts, keys => Keys, me => Me,
-        cursors => load_cursors(Cfg), deposits => #{}, releases => #{}, sent => #{},
+        cursors => Cursors, deposits => Deposits, releases => Releases, sent => #{},
         last_pass => 0, last_error => null, member => false, namespace => 0,
-        timer => undefined, pass_at => 0, fast_until => 0
+        timer => undefined, pass_at => 0, fast_until => 0, fast_since => 0, nudge_at => 0
     },
     ?event(bridge, {started, {ao, Me}}),
     self() ! pass,
@@ -143,16 +150,19 @@ loop(St) ->
         nudge ->
             Now = os:system_time(millisecond),
             Cfg = maps:get(cfg, St),
-            St1 = St#{ fast_until => Now + cfg_ms(Cfg, <<"fast-window">>, 120000) },
-            %% No timer means a pass is already queued; a timer that already
-            %% fired has queued one too. Either way that pass is soon enough.
-            Timer = maps:get(timer, St1),
-            case Timer =/= undefined andalso erlang:cancel_timer(Timer) =/= false of
-                true ->
-                    Delay = max(0, maps:get(pass_at, St1) + cfg_ms(Cfg, <<"fast-interval">>, 1000) - Now),
-                    loop(St1#{ timer => erlang:send_after(Delay, self(), pass) });
-                false ->
-                    loop(St1)
+            case nudge_arm(Now, Cfg, St) of
+                ignore -> loop(St);
+                {ok, St1} ->
+                    %% No timer means a pass is already queued; a timer that already
+                    %% fired has queued one too. Either way that pass is soon enough.
+                    Timer = maps:get(timer, St1),
+                    case Timer =/= undefined andalso erlang:cancel_timer(Timer) =/= false of
+                        true ->
+                            Delay = max(0, maps:get(pass_at, St1) + cfg_ms(Cfg, <<"fast-interval">>, 1000) - Now),
+                            loop(St1#{ timer => erlang:send_after(Delay, self(), pass) });
+                        false ->
+                            loop(St1)
+                    end
             end;
         {status, From, Ref} ->
             From ! {Ref, {ok, status_view(St)}},
@@ -167,6 +177,22 @@ next_interval(Cfg, FastUntil, Now) when Now < FastUntil -> cfg_ms(Cfg, <<"fast-i
 next_interval(Cfg, _FastUntil, _Now) -> cfg_ms(Cfg, <<"interval">>, 5000).
 
 cfg_ms(Cfg, Key, Default) -> hb_util:int(maps:get(Key, Cfg, Default)).
+
+%% Fast mode for a nudge, within limits: at most one arming per NUDGE_GAP_MS,
+%% one stretch of fast passes capped at three `fast-window's, and a capped
+%% stretch followed by one idle `interval' before the next can start.
+nudge_arm(Now, Cfg, St = #{ nudge_at := NudgeAt, fast_since := Since0, fast_until := Until0 }) ->
+    Window = cfg_ms(Cfg, <<"fast-window">>, 120000),
+    Cap = 3 * Window,
+    Fast = Now < Until0,
+    Since = case Fast of true -> Since0; false -> Now end,
+    Until = min(Now + Window, Since + Cap),
+    Cooling = not Fast andalso Until0 =:= Since0 + Cap
+        andalso Now < Until0 + cfg_ms(Cfg, <<"interval">>, 5000),
+    case Now - NudgeAt < ?NUDGE_GAP_MS orelse Cooling orelse Until =< Until0 of
+        true -> ignore;
+        false -> {ok, St#{ nudge_at := Now, fast_since := Since, fast_until := Until }}
+    end.
 
 pass(St) ->
     Info = published(<<"bridgeinfo">>, St),
@@ -184,9 +210,10 @@ attest(Info, St = #{ cfg := Cfg, me := Me }) ->
             St#{ member => false, last_pass => os:system_time(millisecond) };
         true ->
             {Found, Cursors} = scan(Cfg, maps:get(cursors, St), maps:get(opts, St)),
-            save_cursors(Cfg, Cursors),
             Ns = hb_util:int(maps:get(<<"namespace">>, Info, 0)),
             St1 = remember(Found, St#{ cursors => Cursors, member => true, namespace => Ns }),
+            % What was found is on disk before the cursors pass it.
+            save_state(Cfg, St1),
             St2 = attest_deposits(Info, St1),
             St3 = sign_withdrawals(Withdrawals, St2),
             St4 = acknowledge(Withdrawals, St3),
@@ -195,6 +222,7 @@ attest(Info, St = #{ cfg := Cfg, me := Me }) ->
                     Id = hb_util:int(maps:get(<<"id">>, P)),
                     once(<<"vote:", (integer_to_binary(Id))/binary>>, S, fun() -> vote(P, S) end)
                 end, St4, proposals_to_vote(Info, Me)),
+            save_state(Cfg, St5),
             St5#{ last_pass => os:system_time(millisecond), last_error => null }
     end.
 
@@ -522,9 +550,11 @@ load_keys(File) ->
         {error, enoent} ->
             K = #{ base => crypto:strong_rand_bytes(32), solana => crypto:strong_rand_bytes(32),
                    sui => crypto:strong_rand_bytes(32) },
+            % Owner-only before a secret byte is in it.
+            ok = file:write_file(File, <<>>),
+            ok = file:change_mode(File, 8#600),
             ok = file:write_file(File, hb_json:encode(maps:from_list(
                 [{atom_to_binary(N), hb_bridge_sign:hex(V)} || {N, V} <- maps:to_list(K)]))),
-            _ = file:change_mode(File, 8#600),
             K
     end.
 
@@ -539,17 +569,56 @@ public_keys(#{ me := Me, keys := K }) ->
         <<"sui">> => <<"0x", (hb_bridge_sign:hex(hb_bridge_sign:ed25519_public(maps:get(sui, K))))/binary>>
     }.
 
-load_cursors(Cfg) ->
+%% Cursors, deposits and releases. A file holding only cursors (the old shape)
+%% loads with nothing waiting.
+load_state(Cfg) ->
     case file:read_file(maps:get(<<"state-file">>, Cfg, <<"bridge-state.json">>)) of
-        {ok, Bin} -> hb_json:decode(Bin);
-        _ -> #{}
+        {ok, Bin} ->
+            case hb_json:decode(Bin) of
+                #{ <<"cursors">> := C } = S ->
+                    {C, events_in(maps:get(<<"deposits">>, S, #{})),
+                        events_in(maps:get(<<"releases">>, S, #{}))};
+                C -> {C, #{}, #{}}
+            end;
+        _ -> {#{}, #{}, #{}}
     end.
 
-save_cursors(Cfg, Cursors) ->
+save_state(Cfg, #{ cursors := C, deposits := D, releases := R }) ->
     File = maps:get(<<"state-file">>, Cfg, <<"bridge-state.json">>),
     Tmp = <<File/binary, ".tmp">>,
-    ok = file:write_file(Tmp, hb_json:encode(Cursors)),
+    ok = file:write_file(Tmp, hb_json:encode(#{ <<"cursors">> => C,
+        <<"deposits">> => events_out(D), <<"releases">> => events_out(R) })),
     ok = file:rename(Tmp, File).
+
+%% An event is a map with atom keys and `kind' an atom; on disk, all binaries.
+events_out(M) ->
+    maps:map(fun(_, E) -> maps:fold(fun(K, V, A) -> A#{ atom_to_binary(K) =>
+        case is_atom(V) of true -> atom_to_binary(V); false -> V end } end, #{}, E) end, M).
+
+events_in(M) ->
+    maps:map(fun(_, E) -> maps:fold(fun
+        (<<"kind">>, V, A) -> A#{ kind => binary_to_existing_atom(V) };
+        (K, V, A) -> A#{ binary_to_existing_atom(K) => V }
+    end, #{}, E) end, M).
+
+%% Only the host of each RPC: the path or query may carry its key.
+rpc_hosts(Cfg) ->
+    Host = fun(Url) ->
+        case catch uri_string:parse(Url) of
+            #{ host := H } -> H;
+            _ -> null
+        end
+    end,
+    Rpc = fun(Chain, Key, Default) ->
+        case maps:get(Chain, Cfg, undefined) of
+            C when is_map(C) -> [{Chain, Host(maps:get(Key, C, Default))}];
+            _ -> []
+        end
+    end,
+    maps:from_list(Rpc(<<"base">>, <<"rpc">>, null) ++ Rpc(<<"solana">>, <<"rpc">>, null)
+        ++ Rpc(<<"sui">>, <<"graphql">>, <<"https://graphql.mainnet.sui.io/graphql">>)
+        ++ [{<<"pusd-node">>, Host(N)} || N <- [maps:get(<<"pusd-node">>, Cfg, undefined)],
+            N =/= undefined]).
 
 status_view(St) ->
     #{
@@ -560,7 +629,8 @@ status_view(St) ->
         <<"waiting-deposits">> => maps:size(maps:get(deposits, St)),
         <<"waiting-acks">> => maps:size(maps:get(releases, St)),
         <<"last-pass">> => maps:get(last_pass, St),
-        <<"last-error">> => maps:get(last_error, St)
+        <<"last-error">> => maps:get(last_error, St),
+        <<"rpcs">> => rpc_hosts(maps:get(cfg, St))
     }.
 
 %%% Tests ---------------------------------------------------------------------
@@ -570,6 +640,57 @@ next_interval_test() ->
     ?assertEqual(1000, next_interval(Cfg, 2000, 1999)),
     ?assertEqual(15000, next_interval(Cfg, 2000, 2000)),
     ?assertEqual(5000, next_interval(#{}, 0, 1)).
+
+nudge_arm_test() ->
+    Cfg = #{ <<"interval">> => 15000, <<"fast-window">> => 100000 },
+    St0 = #{ nudge_at => 0, fast_since => 0, fast_until => 0 },
+    {ok, St1} = nudge_arm(1000000, Cfg, St0),
+    ?assertMatch(#{ fast_since := 1000000, fast_until := 1100000 }, St1),
+    % Too soon after the last one.
+    ?assertEqual(ignore, nudge_arm(1005000, Cfg, St1)),
+    {ok, St2} = nudge_arm(1010000, Cfg, St1),
+    ?assertMatch(#{ fast_since := 1000000, fast_until := 1110000 }, St2),
+    % Spam stretches fast mode to three windows and no further.
+    StN = lists:foldl(fun(T, S) -> case nudge_arm(T, Cfg, S) of {ok, S2} -> S2; ignore -> S end end,
+        St2, lists:seq(1020000, 1290000, 10000)),
+    ?assertMatch(#{ fast_until := 1300000 }, StN),
+    ?assertEqual(ignore, nudge_arm(1299000, Cfg, StN#{ nudge_at := 0 })),
+    % After a capped stretch, one idle interval before the next.
+    ?assertEqual(ignore, nudge_arm(1310000, Cfg, StN)),
+    ?assertMatch({ok, #{ fast_since := 1316000, fast_until := 1416000 }}, nudge_arm(1316000, Cfg, StN)).
+
+state_file_test() ->
+    Dir = <<"/tmp/bridge-state-test">>,
+    _ = file:make_dir(Dir),
+    File = <<Dir/binary, "/state.json">>,
+    Cfg = #{ <<"state-file">> => File },
+    % The old shape: cursors alone.
+    ok = file:write_file(File, hb_json:encode(#{ <<"base">> => 5 })),
+    ?assertEqual({#{ <<"base">> => 5 }, #{}, #{}}, load_state(Cfg)),
+    D = #{ <<"base:3">> => #{ kind => deposit, chain => <<"base">>, nonce => 3, token => <<"0xt">>,
+        recipient => <<"r">>, amount => <<"10">>, tx => <<"0xa">> } },
+    R = #{ <<"7">> => #{ kind => released, chain => <<"sui">>, id => 7, tx => <<"d">> } },
+    save_state(Cfg, #{ cursors => #{ <<"base">> => 6 }, deposits => D, releases => R }),
+    ?assertEqual({#{ <<"base">> => 6 }, D, R}, load_state(Cfg)).
+
+key_file_mode_test() ->
+    Dir = <<"/tmp/bridge-keys-test">>,
+    _ = file:make_dir(Dir),
+    File = <<Dir/binary, "/keys.json">>,
+    _ = file:delete(File),
+    K = load_keys(File),
+    {ok, Info} = file:read_file_info(File),
+    ?assertEqual(8#600, element(8, Info) band 8#777),
+    ?assertEqual(K, load_keys(File)).
+
+rpc_hosts_test() ->
+    Cfg = #{ <<"pusd-node">> => <<"https://hyperbeam.tylerw.ai">>,
+        <<"base">> => #{ <<"rpc">> => <<"https://base-mainnet.g.alchemy.com/v2/SECRET">> },
+        <<"solana">> => #{ <<"rpc">> => <<"https://solana-mainnet.g.alchemy.com/v2/SECRET?x=1">> },
+        <<"sui">> => #{ <<"package">> => <<"0x1">> } },
+    ?assertEqual(#{ <<"base">> => <<"base-mainnet.g.alchemy.com">>,
+        <<"solana">> => <<"solana-mainnet.g.alchemy.com">>, <<"sui">> => <<"graphql.mainnet.sui.io">>,
+        <<"pusd-node">> => <<"hyperbeam.tylerw.ai">> }, rpc_hosts(Cfg)).
 
 proposals_to_vote_test() ->
     Me = <<"me">>,

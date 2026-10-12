@@ -111,7 +111,9 @@ hex_block(N) -> <<"0x", (integer_to_binary(N, 16))/binary>>.
 %%% Solana --------------------------------------------------------------------
 
 %% @doc Everything the program logged after signature `Until' (undefined:
-%% from the start), oldest first, and the newest signature seen.
+%% from the start), oldest first, and the newest signature fully read. A
+%% transaction the RPC cannot return yet ends the scan there, so the next pass
+%% retries it instead of skipping past a deposit.
 solana_scan(Cfg, Until, Opts) ->
     Url = maps:get(<<"rpc">>, Cfg),
     Program = maps:get(<<"program">>, Cfg),
@@ -121,11 +123,11 @@ solana_scan(Cfg, Until, Opts) ->
             {ok, [], Until};
         {ok, Sigs} ->
             % Newest first from the node; process oldest first.
-            Ordered = lists:reverse(Sigs),
-            case solana_events(Url, Program, Commitment, Ordered, [], Opts) of
-                {ok, Found} -> {ok, Found, maps:get(<<"signature">>, hd(Sigs))};
-                Error -> Error
-            end;
+            GetTx = fun(Sig) ->
+                rpc(Url, <<"getTransaction">>, [Sig, #{ <<"encoding">> => <<"json">>,
+                    <<"commitment">> => Commitment, <<"maxSupportedTransactionVersion">> => 0 }], Opts)
+            end,
+            solana_events(GetTx, Program, lists:reverse(Sigs), [], Until);
         Error ->
             Error
     end.
@@ -142,19 +144,19 @@ solana_signatures(Url, Program, Until, Before, Commitment, Acc, Opts) ->
         Error -> Error
     end.
 
-solana_events(_Url, _Program, _Commitment, [], Acc, _Opts) ->
-    {ok, lists:reverse(Acc)};
-solana_events(Url, Program, Commitment, [#{ <<"err">> := Err } | Rest], Acc, Opts) when Err =/= null ->
-    solana_events(Url, Program, Commitment, Rest, Acc, Opts);
-solana_events(Url, Program, Commitment, [#{ <<"signature">> := Sig } | Rest], Acc, Opts) ->
-    Params = [Sig, #{ <<"encoding">> => <<"json">>, <<"commitment">> => Commitment,
-        <<"maxSupportedTransactionVersion">> => 0 }],
-    case rpc(Url, <<"getTransaction">>, Params, Opts) of
+solana_events(_GetTx, _Program, [], Acc, Last) ->
+    {ok, lists:reverse(Acc), Last};
+solana_events(GetTx, Program, [#{ <<"err">> := Err, <<"signature">> := Sig } | Rest], Acc, _Last)
+        when Err =/= null ->
+    solana_events(GetTx, Program, Rest, Acc, Sig);
+solana_events(GetTx, Program, [#{ <<"signature">> := Sig } | Rest], Acc, Last) ->
+    case GetTx(Sig) of
         {ok, #{ <<"meta">> := #{ <<"logMessages">> := Logs } }} ->
             Found = [E#{ tx => Sig } || E <- anchor_events(Program, Logs)],
-            solana_events(Url, Program, Commitment, Rest, lists:reverse(Found) ++ Acc, Opts);
+            solana_events(GetTx, Program, Rest, lists:reverse(Found) ++ Acc, Sig);
         {ok, _} ->
-            solana_events(Url, Program, Commitment, Rest, Acc, Opts);
+            % Listed but not served yet: stop before it, keep what came first.
+            {ok, lists:reverse(Acc), Last};
         Error ->
             Error
     end.
@@ -277,3 +279,18 @@ anchor_events_ignores_other_programs_test() ->
         Forged
     ],
     ?assertEqual([], anchor_events(?PROG, Logs)).
+
+%% A transaction the RPC returns null for stops the scan before it: the cursor
+%% stays on the last one read, so the next pass retries it.
+solana_events_null_test() ->
+    Ao = <<"abcdefghijklmnopqrstuvwxyzABCDEFGHIJ0123-_Z">>,
+    Logs = fun(N) -> [<<"Program ", ?PROG/binary, " invoke [1]">>,
+        <<"Program data: ", (base64:encode(deposit_bytes(N, 1, Ao)))/binary>>,
+        <<"Program ", ?PROG/binary, " success">>] end,
+    Txs = #{ <<"a">> => #{ <<"meta">> => #{ <<"logMessages">> => Logs(1) } },
+        <<"c">> => #{ <<"meta">> => #{ <<"logMessages">> => Logs(3) } } },
+    GetTx = fun(Sig) -> {ok, maps:get(Sig, Txs, null)} end,
+    Sigs = [#{ <<"signature">> => S, <<"err">> => null } || S <- [<<"a">>, <<"b">>, <<"c">>]],
+    ?assertMatch({ok, [#{ nonce := 1 }], <<"a">>}, solana_events(GetTx, ?PROG, Sigs, [], <<"u">>)),
+    ?assertMatch({ok, [], <<"u">>}, solana_events(GetTx, ?PROG, tl(Sigs), [], <<"u">>)),
+    ?assertMatch({ok, [#{ nonce := 3 }], <<"c">>}, solana_events(GetTx, ?PROG, [lists:last(Sigs)], [], <<"u">>)).
